@@ -1,0 +1,14 @@
+blinker==1.9.0
+click==8.2.1
+colorama==0.4.6
+Flask==3.1.1
+future==1.0.0
+iso8601==2.1.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+logging==0.4.9.6
+MarkupSafe==3.0.2
+PyYAML==6.0.2
+serial==0.0.97
+typing==3.7.4.3
+Werkzeug==3.1.3
