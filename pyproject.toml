@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyvna"
+version = "0.1.0"
+description = "Python reimplementation of GoVNA for low-cost vector network analyzers"
+readme = "README.md"
+authors = [{name = "GoVNA Contributors"}]
+requires-python = ">=3.12"
+dependencies = [
+    "pyserial>=3.5",
+    "prometheus-client>=0.17",
+    "fastapi>=0.104",
+    "uvicorn>=0.23"
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.4",
+    "pytest-mock>=3.11"
+]
