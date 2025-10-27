@@ -1,6 +1,6 @@
 # PyVNA
 
-PyVNA is a Python 3.12+ port of the GoVNA project for interacting with low-cost
+PyVNA is a Python 3.12+ port of the [GoVNA](https://github.com/momentics/GoVNA) project for interacting with low-cost
 vector network analyzers such as the NanoVNA family.  The code mirrors the
 architecture of the original Go implementation while adopting idiomatic Python
 constructs and dependencies.
@@ -15,6 +15,7 @@ Prometheus metrics.
 * Python 3.12 or newer
 * Optional: hardware access to a supported VNA device connected via a serial
   port
+* VNA devices might use [NanoVNA-X](https://github.com/momentics/NanoVNA-X) firmware for supported devices. It is prefferable.
 
 Install the project in editable mode together with the HTTP server and test
 dependencies:
