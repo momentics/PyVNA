@@ -42,6 +42,7 @@ pytest
 * `pyvna/driver_v1.py` – implementation for text-based NanoVNA V1 protocol
 * `pyvna/driver_v2.py` – implementation for the binary NanoVNA V2/LiteVNA
   protocol
+* `pyvna/driver_x.py` – implementation for the NanoVNA-X shell protocol
 * `pyvna/calibration.py` – calibration plans, profiles and error-term handling
 * `pyvna/vna.py` – high level VNA façade and data utilities
 * `pyvna/util/serial_port.py` – serial port abstraction that allows mocking in

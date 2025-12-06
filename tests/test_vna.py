@@ -50,6 +50,42 @@ class MockSerialPort:
             self._write_buffer.extend(data)
             if len(data) >= 2 and data[0] == OP_READ and data[1] == ADDR_DEVICE_VARIANT and self.variant:
                 self._read_buffer.append(self.variant)
+            # Handle V1 vs X protocol - V1 uses "version\n", X uses "version\r\n"
+            elif b"version\r\n" in data:  # X protocol command
+                # For X protocol, if we have set V1-style response data, it should not be used for X
+                # Instead, we should timeout or not respond properly (simulate non-X device)
+                # If there's pre-existing V1-style data, this suggests it's not an X device
+                current_buffer_content = bytes(list(self._read_buffer))
+                if b"nanovna h" in current_buffer_content.lower():
+                    # This is a V1-style device, so X protocol should not work properly
+                    # Don't add a response, leave buffer as is, which will cause timeout in X driver
+                    pass
+                else:
+                    # For a proper X device, respond with shell style
+                    self._read_buffer.extend(b"NanoVNA-X version 1.0\r\nch> ")
+            elif b"version\n" in data and b"\r\n" not in data:  # V1 protocol command
+                # For V1 protocol, if we have pre-stored response data, send it
+                # This path would be hit if V1 driver runs directly
+                # In tests this is handled by set_read_data
+                pass
+            elif b"sweep " in data and b"\r\n" in data and b"ch> " not in data:
+                # Add prompt after sweep command
+                self._read_buffer.extend(b"ch> ")
+            elif b"scan " in data and b"0x83" in data:  # binary scan
+                # Simulate binary scan response with prompt
+                import struct
+                # Create binary mask (0x83) and point count (1 point)
+                self._read_buffer.extend(struct.pack('<HH', 0x83, 1))
+                # Add frequency (1000000 Hz)
+                self._read_buffer.extend(struct.pack('<I', 1000000))
+                # Add S11 (0.5-0.5j) as floats
+                self._read_buffer.extend(struct.pack('<ff', 0.5, -0.5))
+                # Add S21 (0.1-0.1j) as floats
+                self._read_buffer.extend(struct.pack('<ff', 0.1, -0.1))
+                self._read_buffer.extend(b"ch> ")
+            elif b"scan " in data and b"\r\n" in data:  # text scan
+                # Add text scan response with prompt
+                self._read_buffer.extend(b"1000000 0.5 -0.5 0.1 -0.1\r\nch> ")
             return len(data)
 
     def close(self) -> None:  # pragma: no cover - nothing to close in the mock
@@ -295,4 +331,45 @@ def test_open_port_validation() -> None:
     for port in invalid_ports:
         with pytest.raises(ValueError, match="Invalid serial port path"):
             _validate_port_path(port)
+
+
+def test_driver_factory_selects_x() -> None:
+    """Test that driver factory correctly selects X driver for NanoVNA-X devices."""
+    mock = MockSerialPort()
+    # Set up the mock with an initial prompt to flush, then version response
+    mock.set_read_data(b"\r\nch> \r\nNanoVNA Shell\r\nch> ")
+    # X driver should be tried first and succeed
+    driver = driver_factory(mock)
+    from pyvna.driver_x import XDriver
+    assert isinstance(driver, XDriver)
+
+
+def test_xdriver_scan() -> None:
+    """Test X driver scan functionality."""
+    mock = MockSerialPort()
+    from pyvna.driver_x import XDriver
+    driver = XDriver(mock)
+    driver.set_sweep(SweepConfig(start=1e6, stop=1e6, points=1))
+    data = driver.scan()
+    assert len(data.s11) == 1
+    assert data.s11[0] == complex(0.5, -0.5)
+    assert data.s21[0] == complex(0.1, -0.1)
+    assert data.frequencies[0] == 1e6
+
+
+def test_xdriver_scan_binary() -> None:
+    """Test X driver binary scan functionality."""
+    mock = MockSerialPort()
+    from pyvna.driver_x import XDriver
+    driver = XDriver(mock)
+    driver.config = SweepConfig(start=1e6, stop=1e6, points=1)
+
+    # Test that it can read binary data
+    data = driver._read_scan_binary()
+    assert len(data.s11) == 1
+    assert pytest.approx(data.s11[0].real, rel=1e-6) == 0.5
+    assert pytest.approx(data.s11[0].imag, rel=1e-6) == -0.5
+    assert pytest.approx(data.s21[0].real, rel=1e-6) == 0.1
+    assert pytest.approx(data.s21[0].imag, rel=1e-6) == -0.1
+    assert data.frequencies[0] == pytest.approx(1e6)
 

@@ -9,6 +9,7 @@ from .models import SweepConfig, VNAData
 from .vna import VNA
 from .driver_v1 import V1Driver
 from .driver_v2 import V2Driver
+from .driver_x import XDriver
 
 
 class Driver(Protocol):
@@ -26,6 +27,15 @@ class Driver(Protocol):
 def driver_factory(port: SerialPortInterface) -> Driver:
     """Try to detect the device and instantiate the right driver."""
 
+    # Try X driver first (NanoVNA-X with shell protocol)
+    x_driver = XDriver(port)
+    try:
+        x_driver.identify()
+        return x_driver
+    except Exception:
+        pass
+
+    # Try V1 protocol
     v1_driver = V1Driver(port)
     try:
         v1_driver.identify()
@@ -33,6 +43,7 @@ def driver_factory(port: SerialPortInterface) -> Driver:
     except Exception:
         pass
 
+    # Try V2 protocol
     v2_driver = V2Driver(port)
     try:
         v2_driver.identify()
