@@ -251,3 +251,48 @@ def test_vna_apply_calibration_without_profile() -> None:
     with pytest.raises(ValueError):
         vna.apply_calibration(VNAData())
 
+
+def test_open_port_validation() -> None:
+    from pyvna.util.serial_port import open_port
+
+    # Test valid Unix-like ports
+    valid_ports = [
+        "/dev/ttyUSB0",
+        "/dev/ttyACM0",
+        "/dev/ttyS0",
+        "/dev/cu.usbserial",
+        "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AH026KKK-if00-port0",
+        "COM1",
+        "COM10"
+    ]
+
+    # Test validation by importing the implementation
+    from pyvna.util.serial_port import _validate_port_path
+
+    for port in valid_ports:
+        # Should not raise an exception for valid ports (though the port may not exist)
+        try:
+            _validate_port_path(port)
+        except ValueError:
+            pytest.fail(f"Valid port incorrectly rejected: {port}")
+
+    # Test invalid ports
+    invalid_ports = [
+        "/etc/passwd",
+        "../etc/passwd",
+        "/tmp/evil_file.txt",
+        "script.py",
+        "../../../etc/passwd",
+        "/dev/random",
+        "/dev/zero",
+        "COM",
+        "",
+        "COM-1",
+        "/dev/ttyUSBabc",  # No number after USB
+        "/dev/invalid"
+    ]
+
+    for port in invalid_ports:
+        with pytest.raises(ValueError, match="Invalid serial port path"):
+            _validate_port_path(port)
+
