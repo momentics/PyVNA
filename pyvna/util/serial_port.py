@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 try:
-    import serial  # type: ignore[import]
+    # pyserial does not ship type stubs, so the import is marked untyped.
+    import serial  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover - optional dependency
-    serial = None  # type: ignore[assignment]
+    serial = None
 
 
 DEFAULT_READ_TIMEOUT = 1.0
@@ -39,7 +40,7 @@ class SerialPortInterface(Protocol):
 class SerialPort:
     """Wrapper around :mod:`pyserial` providing the expected interface."""
 
-    _serial: serial.Serial  # type: ignore
+    _serial: serial.Serial
 
     def read(self, size: int) -> bytes:
         return self._serial.read(size)

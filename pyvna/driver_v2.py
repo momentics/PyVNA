@@ -92,14 +92,14 @@ class V2Driver(BaseDriver):
         payload[0] = OP_WRITE8
         payload[1] = addr & 0xFF
         struct.pack_into("<d", payload, 2, value)
-        self.port.write(payload)
+        self.port.write(bytes(payload))
 
     def _write_reg16(self, addr: int, value: int) -> None:
         payload = bytearray(4)
         payload[0] = OP_WRITE2
         payload[1] = addr & 0xFF
         struct.pack_into("<H", payload, 2, value & 0xFFFF)
-        self.port.write(payload)
+        self.port.write(bytes(payload))
 
 
 __all__ = ["V2Driver"]
