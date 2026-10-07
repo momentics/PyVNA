@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from threading import RLock
+import threading
 from typing import Protocol
 
 from .driver_v1 import V1Driver
@@ -52,35 +52,83 @@ def driver_factory(port: SerialPortInterface) -> Driver:
 
 
 class VNAPool:
-    """Manage a pool of open VNAs for concurrent access."""
+    """Manages open VNA devices for concurrent access.
+
+    Devices are cached by port path; opening and identification run outside
+    the pool lock so that a slow probe never blocks other ports.
+    """
 
     def __init__(self) -> None:
         self._devices: dict[str, VNA] = {}
-        self._lock = RLock()
+        self._opening: dict[str, threading.Event] = {}
+        self._open_errors: dict[str, Exception] = {}
+        self._lock = threading.Lock()
 
     def get(self, port_path: str) -> VNA:
         with self._lock:
-            if port_path in self._devices:
-                return self._devices[port_path]
+            vna = self._devices.get(port_path)
+            if vna is not None:
+                return vna
+            event = self._opening.get(port_path)
+            if event is None:
+                event = threading.Event()
+                self._opening[port_path] = event
+                owner = True
+            else:
+                owner = False
 
-            logger.debug("opening %s", port_path)
-            port = open_port(port_path, baudrate=115200)
-            try:
-                driver = driver_factory(port)
-            except Exception:
-                port.close()
-                logger.debug("failed to identify device on %s", port_path)
-                raise
+        if not owner:
+            event.wait()
+            with self._lock:
+                error = self._open_errors.pop(port_path, None)
+                vna = self._devices.get(port_path)
+            if vna is not None:
+                return vna
+            if error is None:  # unreachable: owner always stores device or error
+                raise RuntimeError(f"pool state lost for port {port_path}")
+            raise error
 
-            vna = VNA(driver)
-            self._devices[port_path] = vna
+        try:
+            vna = self._open_device(port_path)
+            with self._lock:
+                self._devices[port_path] = vna
+                self._open_errors.pop(port_path, None)
             return vna
+        except Exception as exc:
+            with self._lock:
+                self._open_errors[port_path] = exc
+            raise
+        finally:
+            with self._lock:
+                self._opening.pop(port_path, None)
+            event.set()
+
+    def release(self, port_path: str) -> bool:
+        """Close and drop one device; returns True when a device was present."""
+        with self._lock:
+            vna = self._devices.pop(port_path, None)
+        if vna is None:
+            return False
+        vna.close()
+        return True
 
     def close_all(self) -> None:
         with self._lock:
-            for vna in self._devices.values():
-                vna.close()
+            devices = list(self._devices.values())
             self._devices.clear()
+        for device in devices:
+            device.close()
+
+    @staticmethod
+    def _open_device(port_path: str) -> VNA:
+        port = open_port(port_path)
+        try:
+            driver = driver_factory(port)
+        except Exception:
+            port.close()
+            raise
+        logger.debug("opened %s as %s", port_path, type(driver).__name__)
+        return VNA(driver)
 
 
 __all__ = ["Driver", "driver_factory", "VNAPool"]
