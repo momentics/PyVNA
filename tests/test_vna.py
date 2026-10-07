@@ -379,8 +379,9 @@ def test_xdriver_scan() -> None:
     driver.set_sweep(SweepConfig(start=1_000_000, stop=2_000_000, points=2))
     data = driver.scan()
     assert data.frequencies == [1_000_000.0, 2_000_000.0]
-    assert data.s11 == [complex(0.5, -0.5), complex(-0.2, 0.3)]
-    assert data.s21 == [complex(0.1, -0.1), complex(0.0, 0.2)]
+    # The binary payload carries float32 samples; compare with a tolerance.
+    assert data.s11 == pytest.approx([complex(0.5, -0.5), complex(-0.2, 0.3)], rel=1e-6)
+    assert data.s21 == pytest.approx([complex(0.1, -0.1), complex(0.0, 0.2)], rel=1e-6)
 
 
 def test_xdriver_scan_fast_ordering() -> None:
@@ -396,8 +397,107 @@ def test_xdriver_scan_fast_ordering() -> None:
     driver.set_sweep(SweepConfig(start=1_000_000, stop=2_000_000, points=2))
     data = driver.scan()
     assert data.frequencies == [1_000_000.0, 2_000_000.0]
-    assert data.s11 == [complex(0.5, -0.5), complex(-0.2, 0.3)]
-    assert data.s21 == [complex(0.1, -0.1), complex(0.0, 0.2)]
+    # The binary payload carries float32 samples; compare with a tolerance.
+    assert data.s11 == pytest.approx([complex(0.5, -0.5), complex(-0.2, 0.3)], rel=1e-6)
+    assert data.s21 == pytest.approx([complex(0.1, -0.1), complex(0.0, 0.2)], rel=1e-6)
+
+
+class _BadMaskXDevice(FakeXDevice):
+    """FakeXDevice variant reporting a wrong mask in the binary scan header."""
+
+    def _emit_scan(self, line: str) -> bytes:
+        payload = bytearray(super()._emit_scan(line))
+        # Rewrite the mask field of the 4-byte binary header; keep the count.
+        payload[0:2] = struct.pack("<H", 0x83)
+        return bytes(payload)
+
+
+class _BadCountXDevice(FakeXDevice):
+    """FakeXDevice variant reporting one extra point in the binary header."""
+
+    def _emit_scan(self, line: str) -> bytes:
+        parts = line.split()
+        count = int(parts[3]) + 1  # requested point count plus one
+        out = bytearray(struct.pack("<HH", 0x87, count))
+        for i in range(count):
+            freq = self.scan_points[i % len(self.scan_points)]
+            s11 = self.scan_s11[i % len(self.scan_s11)]
+            s21 = self.scan_s21[i % len(self.scan_s21)]
+            out += struct.pack("<I", int(freq))
+            out += struct.pack("<ff", s11.real, s11.imag)
+            out += struct.pack("<ff", s21.real, s21.imag)
+        return bytes(out)
+
+
+def test_xdriver_scan_binary_golden() -> None:
+    device = FakeXDevice()
+    # Canned sweep: two points, explicit S11/S21 samples (the fake device honours these).
+    device.scan_points = (1_000_000, 3_000_000)
+    device.scan_s11 = (complex(0.5, -0.5), complex(-0.2, 0.3))
+    device.scan_s21 = (complex(0.1, -0.1), complex(0.0, 0.2))
+    port = MockSerialPort(device=device)
+    driver = XDriver(port)
+    driver.identify()
+    driver.set_sweep(SweepConfig(start=1_000_000, stop=3_000_000, points=2))
+    data = driver.scan()
+    assert data.frequencies == [1_000_000.0, 3_000_000.0]
+    # The binary payload carries float32 samples; compare with a tolerance.
+    assert data.s11 == pytest.approx([complex(0.5, -0.5), complex(-0.2, 0.3)], rel=1e-6)
+    assert data.s21 == pytest.approx([complex(0.1, -0.1), complex(0.0, 0.2)], rel=1e-6)
+    # gate: frequencies are stored as float, not the raw uint32
+    assert all(isinstance(f, float) for f in data.frequencies)
+
+
+def test_xdriver_scan_binary_header_mismatch() -> None:
+    device = _BadMaskXDevice()
+    port = MockSerialPort(device=device)
+    driver = XDriver(port)
+    driver.identify()
+    driver.set_sweep(SweepConfig(start=1_000_000, stop=2_000_000, points=1))
+    with pytest.raises(ProtocolError, match="mask"):
+        driver.scan()
+
+
+def test_xdriver_scan_binary_point_count_mismatch() -> None:
+    device = _BadCountXDevice()
+    port = MockSerialPort(device=device)
+    driver = XDriver(port)
+    driver.identify()
+    driver.set_sweep(SweepConfig(start=1_000_000, stop=2_000_000, points=1))
+    with pytest.raises(ProtocolError, match="points"):
+        driver.scan()
+
+
+def test_xdriver_scan_silent_device_bounded() -> None:
+    port = MockSerialPort()  # no device: the wire is completely silent
+    fake = FakeClock()
+    port._on_idle = fake.advance
+    driver = XDriver(port)
+    driver._clock = fake
+    # Bypass set_sweep (it needs a live shell) to probe the scan deadline directly.
+    driver.config = SweepConfig(start=1e6, stop=2e6, points=3)
+    with pytest.raises(ProtocolError):
+        driver.scan()
+    # The budget is X_SCAN_BASE + 3 * X_SCAN_PER_POINT of fake time; well under the bound.
+    assert fake.elapsed < 20
+
+
+def test_xdriver_scan_binary_fast_ordering() -> None:
+    """Binary scan when the payload arrives before the early prompt."""
+    device = _FastXDevice()
+    # Same canned sweep as in test_xdriver_scan.
+    device.scan_points = (1_000_000, 2_000_000)
+    device.scan_s11 = (complex(0.5, -0.5), complex(-0.2, 0.3))
+    device.scan_s21 = (complex(0.1, -0.1), complex(0.0, 0.2))
+    port = MockSerialPort(device=device)
+    driver = XDriver(port)
+    assert driver.identify() == "NanoVNA-X Shell"
+    driver.set_sweep(SweepConfig(start=1_000_000, stop=2_000_000, points=2))
+    data = driver.scan()
+    assert data.frequencies == [1_000_000.0, 2_000_000.0]
+    # The binary payload carries float32 samples; compare with a tolerance.
+    assert data.s11 == pytest.approx([complex(0.5, -0.5), complex(-0.2, 0.3)], rel=1e-6)
+    assert data.s21 == pytest.approx([complex(0.1, -0.1), complex(0.0, 0.2)], rel=1e-6)
 
 
 def test_set_read_timeout_rejects_none() -> None:

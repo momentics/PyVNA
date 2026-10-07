@@ -90,6 +90,8 @@ class FakeXDevice:
         # parts: scan start stop [points] [mask]
         mask = int(parts[4], 0) if len(parts) >= 5 else 0
         points = len(self.scan_points)
+        if mask == 0:
+            return b""  # no output bits selected: the deferred scan prints nothing
         out = bytearray()
         if mask & 0x80:
             out += struct.pack("<HH", mask, points)

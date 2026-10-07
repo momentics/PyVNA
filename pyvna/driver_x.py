@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import struct
 
-from .driver_base import BaseDriver
+from .driver_base import CHUNK_READ_TIMEOUT, BaseDriver
 from .errors import IdentificationError, ProtocolError
 from .models import SweepConfig, VNAData
 
@@ -17,7 +18,8 @@ X_SCAN_BASE = 10.0
 X_SCAN_PER_POINT = 0.02
 X_PROMPT_RESYNC_TIMEOUT = 1.0
 
-TEXT_SCAN_MASK = 0x07  # frequency + S11 + S21, textual output
+BINARY_SCAN_MASK = 0x87  # binary | frequency | S11 | S21
+RECORD_SIZE = 20  # uint32 freq + float32[2] s11 + float32[2] s21
 
 
 class XDriver(BaseDriver):
@@ -83,25 +85,56 @@ class XDriver(BaseDriver):
             logger.debug("x: sweep command output: %r", payload[:120])
 
     def scan(self) -> VNAData:
-        """Run a one-shot sweep and return the text payload (mask 0x07)."""
+        """Run a one-shot sweep and return the binary payload (mask 0x87)."""
         config = self._require_config()
         end = self._clock() + X_SCAN_BASE + X_SCAN_PER_POINT * config.points
         self._flush_input()
         cmd = (
-            f"scan {int(config.start)} {int(config.stop)} {config.points} {TEXT_SCAN_MASK:#04x}\r\n"
+            f"scan {int(config.start)} {int(config.stop)} {config.points} "
+            f"{BINARY_SCAN_MASK:#04x}\r\n"
         ).encode()
         self.port.write(cmd)
-        raw = bytearray()
-        while True:
-            chunk = self._accumulate_until(lambda b: XDriver.PROMPT in b, end - self._clock())
-            if chunk is None:
-                raise ProtocolError(f"x: timed out reading scan data (received {len(raw)} bytes)")
-            raw.extend(chunk)
-            text = bytes(raw).replace(XDriver.PROMPT, b"\n").decode("utf-8", "replace")
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            data = self._parse_text_data(lines, config.points)
-            if data is not None:
-                return data
+        self._consume_echo(end - self._clock())
+        # The deferred command's early prompt, when present, precedes the
+        # payload by exactly four bytes; detect and discard it.
+        first = self._read_exact(4, end - self._clock())
+        header = first if first != XDriver.PROMPT else self._read_exact(4, end - self._clock())
+        mask, count = struct.unpack("<HH", header)
+        if mask != BINARY_SCAN_MASK:
+            raise ProtocolError(
+                f"x: device returned mask {mask:#04x}, expected {BINARY_SCAN_MASK:#04x}"
+            )
+        if count != config.points:
+            raise ProtocolError(f"x: device returned {count} points, expected {config.points}")
+        raw = self._read_exact(count * RECORD_SIZE, end - self._clock())
+        data = VNAData(frequencies=[0.0] * count, s11=[0j] * count, s21=[0j] * count)
+        for i in range(count):
+            offset = i * RECORD_SIZE
+            (freq,) = struct.unpack_from("<I", raw, offset)
+            s11_re, s11_im, s21_re, s21_im = struct.unpack_from("<4f", raw, offset + 4)
+            data.frequencies[i] = float(freq)
+            data.s11[i] = complex(s11_re, s11_im)
+            data.s21[i] = complex(s21_re, s21_im)
+        try:
+            self._read_until_prompt(X_PROMPT_RESYNC_TIMEOUT)  # trailing prompt resync
+        except ProtocolError:
+            logger.debug("x: no trailing prompt after the binary payload; continuing")
+        return data
+
+    def _consume_echo(self, deadline_seconds: float) -> None:
+        """Discard the echoed command line; the shell echoes typed input.
+
+        Bytes are consumed one at a time up to the newline so that any payload
+        arriving in the same burst stays intact for the header read. The echo
+        is bounded by the shell's 64-character input limit.
+        """
+        end = self._clock() + deadline_seconds
+        with self._read_timeout(CHUNK_READ_TIMEOUT):
+            while True:
+                if self._clock() >= end:
+                    raise ProtocolError("x: timed out reading the command echo")
+                if self.port.read(1) == b"\n":
+                    return
 
     def _read_until_prompt(self, deadline_seconds: float) -> str:
         """Read until the shell prompt; return the payload before it."""
@@ -110,30 +143,6 @@ class XDriver(BaseDriver):
             raise ProtocolError("x: timed out waiting for the shell prompt")
         idx = buf.rfind(XDriver.PROMPT)
         return buf[:idx].decode("utf-8", "replace")
-
-    def _parse_text_data(self, lines: list[str], expected_points: int) -> VNAData | None:
-        """Parse scan text lines; None when a complete point set is absent."""
-        data = VNAData(frequencies=[], s11=[], s21=[])
-        for line_no, line in enumerate(lines, start=1):
-            if line.startswith("scan ") or line.startswith("ch>"):
-                continue  # skip the command echo and stray prompt fragments
-            parts = line.split()
-            if len(parts) != 5:
-                raise ProtocolError(f"x: data line {line_no} has {len(parts)} values, expected 5")
-            try:
-                freq, s11_re, s11_im, s21_re, s21_im = (float(p) for p in parts)
-            except ValueError as exc:
-                raise ProtocolError(f"x: data line {line_no} is not numeric") from exc
-            data.frequencies.append(freq)
-            data.s11.append(complex(s11_re, s11_im))
-            data.s21.append(complex(s21_re, s21_im))
-        if len(data.frequencies) > expected_points:
-            raise ProtocolError(
-                f"x: device returned {len(data.frequencies)} points, expected {expected_points}"
-            )
-        if len(data.frequencies) < expected_points:
-            return None
-        return data
 
 
 __all__ = ["XDriver"]
