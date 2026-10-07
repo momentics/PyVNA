@@ -1,5 +1,7 @@
 """PyVNA: Python driver library for NanoVNA-family vector network analyzers."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from . import errors
 from .calibration import (
     CalibrationErrorTerms,
@@ -26,7 +28,12 @@ from .errors import (
 from .models import SweepConfig, VNAData
 from .vna import VNA
 
-__version__ = "0.2.0"
+# The single source of truth for the version is pyproject.toml; the value
+# below is read from the installed package metadata (PEP 621).
+try:
+    __version__ = version("pyvna")
+except PackageNotFoundError:  # pragma: no cover - run from an uninstalled checkout
+    __version__ = "0.0.0"
 
 __all__ = [
     "__version__",

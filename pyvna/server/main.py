@@ -8,10 +8,11 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Histogram, generate_latest
 
+from .. import __version__
 from ..driver import VNAPool
 from ..models import SweepConfig
 
-app = FastAPI(title="PyVNA Server", version="1.0.0")
+app = FastAPI(title="PyVNA Server", version=__version__)
 scan_duration = Histogram(
     "pyvna_scan_duration_seconds",
     "Duration of VNA scan operations",
