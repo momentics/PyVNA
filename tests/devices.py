@@ -1,8 +1,17 @@
-"""Fake VNA devices that emulate wire behaviour for the driver tests."""
+"""Fake VNA devices and shared math helpers for the test suite."""
 
 from __future__ import annotations
 
 import struct
+
+
+def apply_three_term_error_model(
+    e00: complex, e11: complex, tracking: complex, gamma: complex
+) -> complex:
+    """Apply the three-term reflection error model to an ideal load response."""
+    numerator = e11 * gamma
+    denominator = 1 - tracking * gamma
+    return e00 + numerator / denominator
 
 
 class FakeV1Device:

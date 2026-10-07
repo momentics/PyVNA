@@ -22,7 +22,12 @@ from pyvna.errors import DeviceError, IdentificationError, ProtocolError
 from pyvna.models import SweepConfig, VNAData
 from pyvna.util.serial_port import DEFAULT_READ_TIMEOUT
 from pyvna.vna import VNA
-from tests.devices import FakeV1Device, FakeV2Device, FakeXDevice
+from tests.devices import (
+    FakeV1Device,
+    FakeV2Device,
+    FakeXDevice,
+    apply_three_term_error_model,
+)
 
 
 class MockSerialPort:
@@ -233,14 +238,6 @@ class StubDriver:
 
     def close(self) -> None:
         pass
-
-
-def apply_three_term_error_model(
-    e00: complex, e11: complex, tracking: complex, gamma: complex
-) -> complex:
-    numerator = e11 * gamma
-    denominator = 1 - tracking * gamma
-    return e00 + numerator / denominator
 
 
 def test_vna_calibration_workflow() -> None:

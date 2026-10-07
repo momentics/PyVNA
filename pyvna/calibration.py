@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
+from .errors import CalibrationError
 from .models import SweepConfig, VNAData
 
 
@@ -16,6 +17,10 @@ class CalibrationMethod(StrEnum):
 
 
 class CalibrationStandard(StrEnum):
+    """Calibration standards supported by the SOL plan. THRU is measured and
+    stored for two-port plans; host-side profiles apply one-port (S11)
+    error terms, S21 is returned as measured."""
+
     OPEN = "open"
     SHORT = "short"
     LOAD = "load"
@@ -81,6 +86,9 @@ class CalibrationProfile:
                     raise ValueError(f"missing calibration measurement for {required.value}")
 
     def apply(self, data: VNAData) -> VNAData:
+        """De-embeds S11 with the three-term reflection error model and returns a
+        copy of the data; S21 passes through unmodified."""
+        data.validate()
         if len(data.frequencies) != len(self.frequencies):
             raise ValueError("data frequency grid does not match calibration")
         for idx, freq in enumerate(data.frequencies):
@@ -98,18 +106,15 @@ class CalibrationProfile:
             numerator = measurement - e00
             denominator = e11 + tracking * (measurement - e00)
             if denominator == 0:
-                raise ZeroDivisionError(
-                    f"division by zero while applying calibration at {data.frequencies[idx]:.3f} Hz"
+                raise CalibrationError(
+                    f"degenerate calibration data at {data.frequencies[idx]:.3f} Hz: "
+                    "zero denominator"
                 )
             calibrated.s11[idx] = numerator / denominator
         return calibrated
 
 
 def _clone_floats(values: list[float]) -> list[float]:
-    return list(values) if values is not None else []
-
-
-def _clone_complex(values: list[complex]) -> list[complex]:
     return list(values) if values is not None else []
 
 
@@ -133,7 +138,7 @@ def compute_error_terms(profile: CalibrationProfile) -> None:
         _frequencies_match(load_meas.frequencies, open_meas.frequencies)
         and _frequencies_match(load_meas.frequencies, short_meas.frequencies)
     ):
-        raise ValueError("calibration standards use mismatched frequency grids")
+        raise CalibrationError("calibration standards use mismatched frequency grids")
 
     count = len(load_meas.s11)
     directivity: list[complex] = [0j] * count
@@ -146,9 +151,9 @@ def compute_error_terms(profile: CalibrationProfile) -> None:
         ls = short_meas.s11[idx] - e00
         denom = lo - ls
         if denom == 0:
-            raise ZeroDivisionError(
-                "division by zero when computing error terms at "
-                f"{load_meas.frequencies[idx]:.3f} Hz"
+            raise CalibrationError(
+                f"degenerate calibration data at {load_meas.frequencies[idx]:.3f} Hz: "
+                "zero denominator"
             )
         e10e32 = (lo + ls) / denom
         e11 = -ls * (1 + e10e32)

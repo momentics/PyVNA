@@ -15,7 +15,7 @@ from .calibration import (
     CalibrationPrompt,
     compute_error_terms,
 )
-from .errors import DeviceError
+from .errors import CalibrationCancelledError, DeviceError
 from .models import SweepConfig, VNAData
 
 if TYPE_CHECKING:  # pragma: no cover - only used for type checking
@@ -83,6 +83,15 @@ class VNA:
         prompt: CalibrationPrompt | None = None,
         cancel_event: Event | None = None,
     ) -> CalibrationProfile:
+        """Run a calibration plan and install the resulting profile.
+
+        `prompt` is a callback invoked before each standard is measured; it may
+        raise to abort the run, in which case the exception propagates and the
+        profile is not installed. A set `cancel_event` aborts with
+        CalibrationCancelledError before the next step is scanned. The profile
+        is only installed after all standards are measured and the error terms
+        compute and validate successfully; on any failure it stays uninstalled.
+        """
         if not plan.steps:
             raise ValueError("calibration plan does not contain steps")
 
@@ -99,8 +108,8 @@ class VNA:
         )
 
         for step in plan.steps:
-            if cancel_event and cancel_event.is_set():
-                raise TimeoutError("calibration cancelled")
+            if cancel_event is not None and cancel_event.is_set():
+                raise CalibrationCancelledError("calibration was cancelled by the caller")
             if prompt is not None:
                 prompt(step.standard)
             measurement = self._scan_once()

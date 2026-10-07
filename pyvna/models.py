@@ -70,30 +70,32 @@ class VNAData:
                 if not (math.isfinite(sample.real) and math.isfinite(sample.imag)):
                     raise ValueError(f"{name} contains a non-finite value")
 
-    def to_touchstone(self) -> str:
+    def to_touchstone(self, parameter: str = "s11") -> str:
+        """Render the sweep as a Touchstone RI file for one S-parameter."""
         self.validate()
+        if parameter not in ("s11", "s21"):
+            raise ValueError("parameter must be 's11' or 's21'")
+        samples = self.s11 if parameter == "s11" else self.s21
         lines = [
-            "! PyVNA Data Export",
+            "! PyVNA data export",
             f"! Date: {datetime.now(UTC).isoformat()}",
             "# Hz S RI R 50",
         ]
-        for idx in range(len(self.frequencies)):
-            freq = self.frequencies[idx]
-            s11 = self.s11[idx]
-            s21 = self.s21[idx]
-            lines.append(f"{freq:.6f} {s11.real:.6f} {s11.imag:.6f} {s21.real:.6f} {s21.imag:.6f}")
+        for freq, sample in zip(self.frequencies, samples, strict=True):
+            lines.append(f"{freq:.6f} {sample.real:.6f} {sample.imag:.6f}")
         return "\n".join(lines) + "\n"
 
     def calculate_vswr(self) -> list[float]:
+        """Return VSWR derived from |S11|; total reflection maps to inf."""
         self.validate()
-        vswr: list[float] = []
+        result: list[float] = []
         for reflection in self.s11:
             gamma = abs(reflection)
             if gamma >= 1.0:
-                vswr.append(9999.0)
+                result.append(float("inf"))
             else:
-                vswr.append((1 + gamma) / (1 - gamma))
-        return vswr
+                result.append((1 + gamma) / (1 - gamma))
+        return result
 
 
 __all__ = ["SweepConfig", "VNAData"]
