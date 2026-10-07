@@ -1,21 +1,21 @@
 """Calibration models and helpers."""
+
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
-from typing import Callable, Dict, List
-
-import math
+from enum import StrEnum
 
 from .models import SweepConfig, VNAData
 
 
-class CalibrationMethod(str, Enum):
+class CalibrationMethod(StrEnum):
     SOL = "SOL"
 
 
-class CalibrationStandard(str, Enum):
+class CalibrationStandard(StrEnum):
     OPEN = "open"
     SHORT = "short"
     LOAD = "load"
@@ -31,7 +31,7 @@ class CalibrationStep:
 class CalibrationPlan:
     name: str
     sweep: SweepConfig
-    steps: List[CalibrationStep]
+    steps: list[CalibrationStep]
 
 
 CalibrationPrompt = Callable[[CalibrationStandard], None]
@@ -39,16 +39,16 @@ CalibrationPrompt = Callable[[CalibrationStandard], None]
 
 @dataclass
 class CalibrationMeasurement:
-    frequencies: List[float]
-    s11: List[complex]
-    s21: List[complex]
+    frequencies: list[float]
+    s11: list[complex]
+    s21: list[complex]
 
 
 @dataclass
 class CalibrationErrorTerms:
-    directivity: List[complex] = field(default_factory=list)
-    source_match: List[complex] = field(default_factory=list)
-    reflection_tracking: List[complex] = field(default_factory=list)
+    directivity: list[complex] = field(default_factory=list)
+    source_match: list[complex] = field(default_factory=list)
+    reflection_tracking: list[complex] = field(default_factory=list)
 
 
 @dataclass
@@ -57,8 +57,8 @@ class CalibrationProfile:
     method: CalibrationMethod
     created_at: datetime
     sweep: SweepConfig
-    frequencies: List[float]
-    standards: Dict[CalibrationStandard, CalibrationMeasurement]
+    frequencies: list[float]
+    standards: dict[CalibrationStandard, CalibrationMeasurement]
     error_terms: CalibrationErrorTerms
 
     def validate(self) -> None:
@@ -72,7 +72,11 @@ class CalibrationProfile:
         ):
             raise ValueError("calibration coefficients do not match frequency grid")
         if self.method is CalibrationMethod.SOL:
-            for required in (CalibrationStandard.OPEN, CalibrationStandard.SHORT, CalibrationStandard.LOAD):
+            for required in (
+                CalibrationStandard.OPEN,
+                CalibrationStandard.SHORT,
+                CalibrationStandard.LOAD,
+            ):
                 if required not in self.standards:
                     raise ValueError(f"missing calibration measurement for {required.value}")
 
@@ -101,18 +105,18 @@ class CalibrationProfile:
         return calibrated
 
 
-def _clone_floats(values: List[float]) -> List[float]:
+def _clone_floats(values: list[float]) -> list[float]:
     return list(values) if values is not None else []
 
 
-def _clone_complex(values: List[complex]) -> List[complex]:
+def _clone_complex(values: list[complex]) -> list[complex]:
     return list(values) if values is not None else []
 
 
-def _frequencies_match(a: List[float], b: List[float]) -> bool:
+def _frequencies_match(a: list[float], b: list[float]) -> bool:
     if len(a) != len(b):
         return False
-    return all(math.isclose(x, y, rel_tol=0, abs_tol=1e-3) for x, y in zip(a, b))
+    return all(math.isclose(x, y, rel_tol=0, abs_tol=1e-3) for x, y in zip(a, b, strict=True))
 
 
 def compute_error_terms(profile: CalibrationProfile) -> None:
@@ -132,9 +136,9 @@ def compute_error_terms(profile: CalibrationProfile) -> None:
         raise ValueError("calibration standards use mismatched frequency grids")
 
     count = len(load_meas.s11)
-    directivity: List[complex] = [0j] * count
-    source_match: List[complex] = [0j] * count
-    tracking: List[complex] = [0j] * count
+    directivity: list[complex] = [0j] * count
+    source_match: list[complex] = [0j] * count
+    tracking: list[complex] = [0j] * count
 
     for idx in range(count):
         e00 = load_meas.s11[idx]
@@ -143,7 +147,8 @@ def compute_error_terms(profile: CalibrationProfile) -> None:
         denom = lo - ls
         if denom == 0:
             raise ZeroDivisionError(
-                f"division by zero when computing error terms at {load_meas.frequencies[idx]:.3f} Hz"
+                "division by zero when computing error terms at "
+                f"{load_meas.frequencies[idx]:.3f} Hz"
             )
         e10e32 = (lo + ls) / denom
         e11 = -ls * (1 + e10e32)

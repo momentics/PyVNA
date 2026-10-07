@@ -1,4 +1,5 @@
 """Example HTTP server mirroring the Go reference implementation."""
+
 from __future__ import annotations
 
 import time

@@ -1,31 +1,49 @@
 from __future__ import annotations
 
+import math
 import struct
 import threading
+import time
 from collections import deque
 
 import pytest
 
+from pyvna.calibration import (
+    CalibrationMethod,
+    CalibrationPlan,
+    CalibrationStandard,
+    CalibrationStep,
+)
 from pyvna.driver import driver_factory
 from pyvna.driver_v1 import V1Driver
-from pyvna.driver_v2 import V2Driver, OP_READ, ADDR_DEVICE_VARIANT
+from pyvna.driver_v2 import V2Driver
+from pyvna.driver_x import XDriver
+from pyvna.errors import DeviceError, IdentificationError, ProtocolError
 from pyvna.models import SweepConfig, VNAData
+from pyvna.util.serial_port import DEFAULT_READ_TIMEOUT
 from pyvna.vna import VNA
-from pyvna.calibration import (
-    CalibrationPlan,
-    CalibrationMethod,
-    CalibrationStep,
-    CalibrationStandard,
-)
+from tests.devices import FakeV1Device, FakeV2Device, FakeXDevice
 
 
 class MockSerialPort:
-    def __init__(self) -> None:
+    """In-memory serial port used by the driver and factory tests.
+
+    Reads emulate pyserial's bounded reads: when the buffer is empty a read
+    blocks for the current timeout (via _on_idle) and then returns b"".
+    Tests that exercise deadline logic without real waiting hang a fake
+    clock on both the port and the driver under test.
+    """
+
+    def __init__(self, device=None) -> None:
         self._read_buffer = deque()  # type: deque[int]
         self._write_buffer = bytearray()
         self._lock = threading.Lock()
-        self.variant = 0
-        self.timeout = None
+        self.timeout_values: list[float] = []
+        self.timeout = DEFAULT_READ_TIMEOUT
+        self.device = device
+        self._on_idle = time.sleep
+        if device is not None:
+            device.attach(self)
 
     def read(self, size: int) -> bytes:
         with self._lock:
@@ -33,6 +51,10 @@ class MockSerialPort:
             while size and self._read_buffer:
                 data.append(self._read_buffer.popleft())
                 size -= 1
+            if not data:
+                # Emulate the expiry of the finite read timeout: pyserial
+                # blocks for the timeout, then returns an empty chunk.
+                self._on_idle(self.timeout)
             return bytes(data)
 
     def readline(self) -> bytes:
@@ -48,51 +70,21 @@ class MockSerialPort:
     def write(self, data: bytes) -> int:
         with self._lock:
             self._write_buffer.extend(data)
-            if len(data) >= 2 and data[0] == OP_READ and data[1] == ADDR_DEVICE_VARIANT and self.variant:
-                self._read_buffer.append(self.variant)
-            # Handle V1 vs X protocol - V1 uses "version\n", X uses "version\r\n"
-            elif b"version\r\n" in data:  # X protocol command
-                # For X protocol, if we have set V1-style response data, it should not be used for X
-                # Instead, we should timeout or not respond properly (simulate non-X device)
-                # If there's pre-existing V1-style data, this suggests it's not an X device
-                current_buffer_content = bytes(list(self._read_buffer))
-                if b"nanovna h" in current_buffer_content.lower():
-                    # This is a V1-style device, so X protocol should not work properly
-                    # Don't add a response, leave buffer as is, which will cause timeout in X driver
-                    pass
-                else:
-                    # For a proper X device, respond with shell style
-                    self._read_buffer.extend(b"NanoVNA-X version 1.0\r\nch> ")
-            elif b"version\n" in data and b"\r\n" not in data:  # V1 protocol command
-                # For V1 protocol, if we have pre-stored response data, send it
-                # This path would be hit if V1 driver runs directly
-                # In tests this is handled by set_read_data
-                pass
-            elif b"sweep " in data and b"\r\n" in data and b"ch> " not in data:
-                # Add prompt after sweep command
-                self._read_buffer.extend(b"ch> ")
-            elif b"scan " in data and b"0x83" in data:  # binary scan
-                # Simulate binary scan response with prompt
-                import struct
-                # Create binary mask (0x83) and point count (1 point)
-                self._read_buffer.extend(struct.pack('<HH', 0x83, 1))
-                # Add frequency (1000000 Hz)
-                self._read_buffer.extend(struct.pack('<I', 1000000))
-                # Add S11 (0.5-0.5j) as floats
-                self._read_buffer.extend(struct.pack('<ff', 0.5, -0.5))
-                # Add S21 (0.1-0.1j) as floats
-                self._read_buffer.extend(struct.pack('<ff', 0.1, -0.1))
-                self._read_buffer.extend(b"ch> ")
-            elif b"scan " in data and b"\r\n" in data:  # text scan
-                # Add text scan response with prompt
-                self._read_buffer.extend(b"1000000 0.5 -0.5 0.1 -0.1\r\nch> ")
-            return len(data)
+        if self.device is not None:
+            self.device.on_write(bytes(data), self)
+        return len(data)
 
     def close(self) -> None:  # pragma: no cover - nothing to close in the mock
         pass
 
-    def set_read_timeout(self, timeout: float | None) -> None:
+    def set_read_timeout(self, timeout: float) -> None:
+        if timeout is None:
+            raise TypeError("blocking reads are forbidden")
         self.timeout = timeout
+        self.timeout_values.append(timeout)
+
+    def get_read_timeout(self) -> float:
+        return self.timeout
 
     def set_read_data(self, payload: bytes) -> None:
         with self._lock:
@@ -104,21 +96,33 @@ class MockSerialPort:
             self._write_buffer.clear()
 
 
+class FakeClock:
+    """Controllable monotonic clock for deadline logic in tests."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.elapsed = 0.0
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        self.elapsed += seconds
+
+    def __call__(self) -> float:
+        return self.now
+
+
 def float32_bytes(value: float) -> bytes:
     return struct.pack("<f", value)
 
 
 def test_driver_factory_selects_v1() -> None:
-    mock = MockSerialPort()
-    mock.set_read_data(b"NanoVNA H\n")
+    mock = MockSerialPort(device=FakeV1Device())
     driver = driver_factory(mock)
     assert isinstance(driver, V1Driver)
 
 
 def test_driver_factory_selects_v2() -> None:
-    mock = MockSerialPort()
-    mock.variant = 0x02
-    mock.set_read_data(b"unrecognized\n")
+    mock = MockSerialPort(device=FakeV2Device(variant=2))
     driver = driver_factory(mock)
     assert isinstance(driver, V2Driver)
 
@@ -126,8 +130,8 @@ def test_driver_factory_selects_v2() -> None:
 def test_v1driver_scan() -> None:
     mock = MockSerialPort()
     driver = V1Driver(mock)
-    driver.set_sweep(SweepConfig(start=0, stop=0, points=1))
-    mock.set_read_data(b"1000000 0.5 -0.5 0.1 -0.1\n")
+    driver.set_sweep(SweepConfig(start=1_000_000, stop=1_000_000, points=1))
+    mock.set_read_data(b"1000000 0.5 -0.5 0.1 -0.1\r\n")
     data = driver.scan()
     assert len(data.s11) == 1
     assert data.s11[0] == complex(0.5, -0.5)
@@ -136,16 +140,16 @@ def test_v1driver_scan() -> None:
 def test_v1driver_scan_invalid_data() -> None:
     mock = MockSerialPort()
     driver = V1Driver(mock)
-    driver.set_sweep(SweepConfig(start=0, stop=0, points=1))
+    driver.set_sweep(SweepConfig(start=1_000_000, stop=1_000_000, points=1))
     mock.set_read_data(b"1000000 0.5 nope 0.1 -0.1\n")
-    with pytest.raises(ValueError):
+    with pytest.raises(ProtocolError):
         driver.scan()
 
     mock = MockSerialPort()
     driver = V1Driver(mock)
-    driver.set_sweep(SweepConfig(start=0, stop=0, points=1))
+    driver.set_sweep(SweepConfig(start=1_000_000, stop=1_000_000, points=1))
     mock.set_read_data(b"1000000 0.5\n")
-    with pytest.raises(ValueError):
+    with pytest.raises(ProtocolError):
         driver.scan()
 
 
@@ -169,7 +173,10 @@ def test_v2driver_scan() -> None:
 
 def test_v2driver_scan_unexpected_eof() -> None:
     mock = MockSerialPort()
+    fake = FakeClock()
+    mock._on_idle = fake.advance
     driver = V2Driver(mock)
+    driver._clock = fake
     driver.set_sweep(SweepConfig(start=1e6, stop=2e6, points=2))
     payload = bytearray()
     payload.extend(float32_bytes(0.5))
@@ -179,7 +186,7 @@ def test_v2driver_scan_unexpected_eof() -> None:
     payload.extend(float32_bytes(-0.1))
     payload.extend(b"\x00" * 8)
     mock.set_read_data(bytes(payload))
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ProtocolError):
         driver.scan()
 
 
@@ -187,9 +194,9 @@ def test_v2driver_parse_binary_data_validation() -> None:
     mock = MockSerialPort()
     driver = V2Driver(mock)
     driver.config = SweepConfig(start=1e6, stop=2e6, points=2)
-    with pytest.raises(ValueError):
+    with pytest.raises(ProtocolError):
         driver._parse_binary_data(b"\x00" * 12)
-    with pytest.raises(ValueError):
+    with pytest.raises(ProtocolError):
         driver._parse_binary_data(b"\x00" * 32)
 
 
@@ -208,6 +215,7 @@ class StubDriver:
         self._sequence = sequence
         self._lock = threading.Lock()
         self._cursor = 0
+        self.model = None
 
     def identify(self) -> str:  # pragma: no cover - not used in tests
         return "stub"
@@ -227,7 +235,9 @@ class StubDriver:
         pass
 
 
-def apply_three_term_error_model(e00: complex, e11: complex, tracking: complex, gamma: complex) -> complex:
+def apply_three_term_error_model(
+    e00: complex, e11: complex, tracking: complex, gamma: complex
+) -> complex:
     numerator = e11 * gamma
     denominator = 1 - tracking * gamma
     return e00 + numerator / denominator
@@ -289,7 +299,6 @@ def test_vna_apply_calibration_without_profile() -> None:
 
 
 def test_open_port_validation() -> None:
-    from pyvna.util.serial_port import open_port
 
     # Test valid Unix-like ports
     valid_ports = [
@@ -299,7 +308,7 @@ def test_open_port_validation() -> None:
         "/dev/cu.usbserial",
         "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AH026KKK-if00-port0",
         "COM1",
-        "COM10"
+        "COM10",
     ]
 
     # Test validation by importing the implementation
@@ -325,7 +334,7 @@ def test_open_port_validation() -> None:
         "",
         "COM-1",
         "/dev/ttyUSBabc",  # No number after USB
-        "/dev/invalid"
+        "/dev/invalid",
     ]
 
     for port in invalid_ports:
@@ -335,41 +344,141 @@ def test_open_port_validation() -> None:
 
 def test_driver_factory_selects_x() -> None:
     """Test that driver factory correctly selects X driver for NanoVNA-X devices."""
-    mock = MockSerialPort()
-    # Set up the mock with an initial prompt to flush, then version response
-    mock.set_read_data(b"\r\nch> \r\nNanoVNA Shell\r\nch> ")
+    mock = MockSerialPort(device=FakeXDevice())
     # X driver should be tried first and succeed
     driver = driver_factory(mock)
-    from pyvna.driver_x import XDriver
     assert isinstance(driver, XDriver)
+
+
+class _FastXDevice(FakeXDevice):
+    """FakeXDevice variant where scan output arrives before the early prompt.
+
+    The measurement thread can finish its output before the shell loop prints
+    the early prompt; the driver must accept that ordering as well.
+    """
+
+    def on_write(self, data: bytes, port) -> None:
+        line = data.split(b"\r\n", 1)[0].decode("utf-8", "replace").strip()
+        if line.startswith("scan "):
+            # No early prompt: echo + payload + final prompt only.
+            port.set_read_data(data + self._emit_scan(line) + FakeXDevice.PROMPT)
+        else:
+            super().on_write(data, port)
 
 
 def test_xdriver_scan() -> None:
     """Test X driver scan functionality."""
-    mock = MockSerialPort()
-    from pyvna.driver_x import XDriver
-    driver = XDriver(mock)
-    driver.set_sweep(SweepConfig(start=1e6, stop=1e6, points=1))
+    device = FakeXDevice()
+    # Canned sweep: two points with explicit S11/S21 samples.
+    device.scan_points = (1_000_000, 2_000_000)
+    device.scan_s11 = (complex(0.5, -0.5), complex(-0.2, 0.3))
+    device.scan_s21 = (complex(0.1, -0.1), complex(0.0, 0.2))
+    port = MockSerialPort(device=device)
+    driver = XDriver(port)
+    assert driver.identify() == "NanoVNA-X Shell"
+    driver.set_sweep(SweepConfig(start=1_000_000, stop=2_000_000, points=2))
     data = driver.scan()
-    assert len(data.s11) == 1
-    assert data.s11[0] == complex(0.5, -0.5)
-    assert data.s21[0] == complex(0.1, -0.1)
-    assert data.frequencies[0] == 1e6
+    assert data.frequencies == [1_000_000.0, 2_000_000.0]
+    assert data.s11 == [complex(0.5, -0.5), complex(-0.2, 0.3)]
+    assert data.s21 == [complex(0.1, -0.1), complex(0.0, 0.2)]
 
 
-def test_xdriver_scan_binary() -> None:
-    """Test X driver binary scan functionality."""
-    mock = MockSerialPort()
-    from pyvna.driver_x import XDriver
-    driver = XDriver(mock)
-    driver.config = SweepConfig(start=1e6, stop=1e6, points=1)
+def test_xdriver_scan_fast_ordering() -> None:
+    """Test X driver scan when the payload arrives before the early prompt."""
+    device = _FastXDevice()
+    # Same canned sweep as in test_xdriver_scan.
+    device.scan_points = (1_000_000, 2_000_000)
+    device.scan_s11 = (complex(0.5, -0.5), complex(-0.2, 0.3))
+    device.scan_s21 = (complex(0.1, -0.1), complex(0.0, 0.2))
+    port = MockSerialPort(device=device)
+    driver = XDriver(port)
+    assert driver.identify() == "NanoVNA-X Shell"
+    driver.set_sweep(SweepConfig(start=1_000_000, stop=2_000_000, points=2))
+    data = driver.scan()
+    assert data.frequencies == [1_000_000.0, 2_000_000.0]
+    assert data.s11 == [complex(0.5, -0.5), complex(-0.2, 0.3)]
+    assert data.s21 == [complex(0.1, -0.1), complex(0.0, 0.2)]
 
-    # Test that it can read binary data
-    data = driver._read_scan_binary()
-    assert len(data.s11) == 1
-    assert pytest.approx(data.s11[0].real, rel=1e-6) == 0.5
-    assert pytest.approx(data.s11[0].imag, rel=1e-6) == -0.5
-    assert pytest.approx(data.s21[0].real, rel=1e-6) == 0.1
-    assert pytest.approx(data.s21[0].imag, rel=1e-6) == -0.1
-    assert data.frequencies[0] == pytest.approx(1e6)
 
+def test_set_read_timeout_rejects_none() -> None:
+    port = MockSerialPort()
+    blocking_timeout = None
+    with pytest.raises(TypeError):
+        port.set_read_timeout(blocking_timeout)
+
+
+@pytest.mark.parametrize(
+    ("device", "driver_cls"),
+    [
+        pytest.param(FakeV1Device(), V1Driver, id="v1"),
+        pytest.param(FakeV2Device(variant=2), V2Driver, id="v2"),
+        pytest.param(FakeXDevice(), XDriver, id="x"),
+    ],
+)
+def test_identify_uses_only_finite_timeouts(device: object, driver_cls: type) -> None:
+    port = MockSerialPort(device=device)
+    driver = driver_cls(port)
+    driver.identify()
+    assert port.timeout_values
+    for value in port.timeout_values:
+        assert math.isfinite(value) and value > 0
+
+
+def test_x_identify_rejects_v1_device() -> None:
+    with pytest.raises(IdentificationError):
+        XDriver(MockSerialPort(device=FakeV1Device())).identify()
+
+    # The same wire is a perfectly good V1 device on its own.
+    port = MockSerialPort(device=FakeV1Device())
+    driver = V1Driver(port)
+    model = driver.identify()
+    assert "nanovna" in model.lower()
+
+
+def test_x_identify_version_fallback() -> None:
+    # No banner on the wire: identification must fall back to the version
+    # query, whose reply is a bare semver plus prompt and echoed command.
+    port = MockSerialPort(device=FakeXDevice(banner=False))
+    driver = XDriver(port)
+    model = driver.identify()
+    assert model == "NanoVNA-X 0.9.102"
+
+
+def test_factory_error_aggregation() -> None:
+    # A completely silent wire fails every probe; the error names them all.
+    port = MockSerialPort()
+    with pytest.raises(RuntimeError) as excinfo:
+        driver_factory(port)
+    message = str(excinfo.value)
+    assert "XDriver" in message
+    assert "V1Driver" in message
+    assert "V2Driver" in message
+
+
+def test_vna_model_property() -> None:
+    port = MockSerialPort(device=FakeXDevice())
+    driver = XDriver(port)
+    driver.identify()
+    vna = VNA(driver)
+    assert isinstance(vna.model, str)
+
+    # A driver that has not been identified reports it explicitly.
+    unidentified = VNA(StubDriver([]))
+    with pytest.raises(DeviceError):
+        _ = unidentified.model
+
+
+@pytest.mark.parametrize("driver_cls", [V1Driver, V2Driver, XDriver])
+def test_unconfigured_scan_raises_device_error(driver_cls: type) -> None:
+    driver = driver_cls(MockSerialPort())
+    with pytest.raises(DeviceError):
+        driver.scan()
+
+
+def test_version_matches_pyproject() -> None:
+    import tomllib
+    from pathlib import Path
+
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    pyproject = tomllib.loads(pyproject_path.read_text("utf-8"))
+    assert pyproject["project"]["version"] == __import__("pyvna").__version__

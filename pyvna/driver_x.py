@@ -1,274 +1,138 @@
 """Driver implementation for the NanoVNA-X shell protocol."""
+
 from __future__ import annotations
 
-import struct
-import time
-from dataclasses import dataclass, field
+import logging
 
-from .util.serial_port import SerialPortInterface
+from .driver_base import BaseDriver
+from .errors import IdentificationError, ProtocolError
 from .models import SweepConfig, VNAData
 
+logger = logging.getLogger(__name__)
 
-@dataclass
-class XDriver:
+X_BANNER_DEADLINE = 2.0
+X_VERSION_FALLBACK_DEADLINE = 1.5
+X_COMMAND_TIMEOUT = 5.0
+X_SCAN_BASE = 10.0
+X_SCAN_PER_POINT = 0.02
+X_PROMPT_RESYNC_TIMEOUT = 1.0
+
+TEXT_SCAN_MASK = 0x07  # frequency + S11 + S21, textual output
+
+
+class XDriver(BaseDriver):
     """Driver implementation for NanoVNA-X shell protocol."""
-    port: SerialPortInterface
-    config: SweepConfig = field(default_factory=lambda: SweepConfig(0.0, 0.0, 0))
-    
+
+    PROMPT = b"ch> "
+
     def identify(self) -> str:
-        """Identify the device using the version command."""
-        # First wait for any initial prompt if available
+        # The shell prints a prompt as soon as the session is active; builds
+        # with an SD card prefix it with a one-line banner carrying the
+        # device name. Detection keys off that first prompt.
+        buf = self._accumulate_until(lambda b: XDriver.PROMPT in b, X_BANNER_DEADLINE)
+        if buf is not None and b"nanovna" in buf.lower():
+            self.model = self._model_from_banner(buf)
+            return self.model
+        # No named banner (or no shell at all): probe with the version
+        # query. The reply is a bare semver, so the prompt plus our own
+        # echoed command is what identifies the shell.
         self._flush_input()
-
-        # Send version command
         self.port.write(b"version\r\n")
+        buf = self._accumulate_until(self._looks_like_x_version_reply, X_VERSION_FALLBACK_DEADLINE)
+        if buf is None:
+            raise IdentificationError(
+                "x: no shell prompt received on connection or after the version query"
+            )
+        version_line = self._version_line_from_reply(buf)
+        self.model = f"NanoVNA-X {version_line}" if version_line else "NanoVNA-X"
+        return self.model
 
-        # Read response until we see the prompt
-        response = self._read_until_prompt()
+    @staticmethod
+    def _looks_like_x_version_reply(buf: bytes) -> bool:
+        return b"version" in buf and XDriver.PROMPT in buf
 
-        # The response structure should be: [optional banner] + version info + ch> prompt
-        # Check if the response ends with the shell prompt which is characteristic of NanoVNA-X
-        if not response.strip().endswith('ch>'):
-            raise RuntimeError("x: device did not send expected shell prompt")
+    @staticmethod
+    def _model_from_banner(buf: bytes) -> str:
+        for line in buf.splitlines():
+            if b"nanovna" in line.lower():
+                return line.decode("utf-8", "replace").strip()
+        return "NanoVNA-X Shell"
 
-        # Look for lines that contain NanoVNA identification
-        lines = [line.strip() for line in response.split('\n') if line.strip() and not line.strip().endswith('ch>') and line.strip() != 'ch>']
-
-        for line in lines:
-            if "nanovna" in line.lower() and "x" in line.lower():
-                # If we find a line with nanovna-x, this indicates a NanoVNA-X device
-                return line.strip()
-            elif "nanovna" in line.lower():
-                # If we find a general nanovna response with the shell prompt,
-                # treat it as compatible (some versions might not explicitly say "X")
-                return line.strip()
-
-        raise RuntimeError("x: device did not identify as NanoVNA-X compatible")
+    @staticmethod
+    def _version_line_from_reply(buf: bytes) -> str:
+        for line in buf.splitlines():
+            text = line.decode("utf-8", "replace").strip()
+            if not text or text == "version" or XDriver.PROMPT in line:
+                continue
+            return text
+        return ""
 
     def set_sweep(self, config: SweepConfig) -> None:
-        """Configure sweep parameters."""
-        # Set the sweep parameters
-        cmd = f"sweep {int(config.start)} {int(config.stop)} {config.points}\r\n"
-        self.port.write(cmd.encode())
-        
-        # Wait for command to complete
-        self._read_until_prompt()
-        
+        """Configure the continuous sweep on the device.
+
+        The sweep command is deferred to the measurement thread; the prompt
+        that follows the echo does not mean the engine applied the settings
+        yet. A later scan command runs after it (FIFO order on the device).
+        """
         self.config = config
+        self._flush_input()
+        cmd = f"sweep {int(config.start)} {int(config.stop)} {config.points}\r\n".encode()
+        self.port.write(cmd)
+        payload = self._read_until_prompt(X_COMMAND_TIMEOUT)
+        if payload.strip():
+            logger.debug("x: sweep command output: %r", payload[:120])
 
     def scan(self) -> VNAData:
-        """Perform a scan and return data."""
-        if self.config.points <= 0:
-            raise RuntimeError("x: sweep not configured or zero points requested")
-        
-        # Request scan data with mask 0x03 (include freq, S11, S21)
-        # Use the scan command with mask to get textual output
-        cmd = f"scan {int(self.config.start)} {int(self.config.stop)} {self.config.points} 0x03\r\n"
-        self.port.write(cmd.encode())
-        
-        # Read the data until prompt
-        response = self._read_until_prompt()
-        
-        # Parse text response
-        return self._parse_text_data(response)
-
-    def close(self) -> None:
-        """Close the connection."""
-        self.port.close()
-
-    def _read_until_prompt(self) -> str:
-        """Read data until the shell prompt 'ch> ' is received."""
-        buffer = bytearray()
-        timeout = 5.0  # 5 second timeout
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout:
-            chunk = self.port.read(1)
-            if not chunk:
-                time.sleep(0.01)  # Small delay to avoid busy waiting
-                continue
-            
-            buffer.extend(chunk)
-            
-            # Check if the end of buffer contains the prompt
-            buf_str = buffer.decode('utf-8', errors='ignore')
-            if buf_str.endswith('ch> '):
-                # Return everything except the prompt
-                result = buf_str[:-4]  # Remove 'ch> ' from end
-                return result
-        
-        raise RuntimeError(f"x: timeout waiting for prompt after {timeout}s")
-
-    def _parse_text_data(self, response: str) -> VNAData:
-        """Parse text response from scan command."""
-        data = VNAData(frequencies=[], s11=[], s21=[])
-        
-        lines = response.strip().split('\n')
-        
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('scan ') or line.startswith('ch>'):
-                continue  # Skip command echoes and prompts
-            
-            # Parse line: freq s11_real s11_imag s21_real s21_im
-            parts = line.split()
-            if len(parts) >= 5:
-                try:
-                    freq = float(parts[0])
-                    s11_real = float(parts[1])
-                    s11_imag = float(parts[2])
-                    s21_real = float(parts[3])
-                    s21_imag = float(parts[4])
-                    
-                    data.frequencies.append(freq)
-                    data.s11.append(complex(s11_real, s11_imag))
-                    data.s21.append(complex(s21_real, s21_imag))
-                except ValueError:
-                    continue  # Skip lines with invalid data
-        
-        if len(data.frequencies) != self.config.points:
-            raise ValueError(
-                f"x: expected {self.config.points} data points, got {len(data.frequencies)}"
-            )
-        
-        return data
-
-    def _flush_input(self) -> None:
-        """Flush any pending input data."""
-        self._flush_input_capture()  # Call capture version and discard the result
-
-    def _flush_input_capture(self) -> bytearray:
-        """Flush any pending input data and return it."""
-        # Set a short timeout to read any pending data if the port supports it
-        old_timeout = getattr(self.port, 'timeout', None)
-        if hasattr(self.port, 'set_read_timeout'):
-            self.port.set_read_timeout(0.1)
-
-        flushed_data = bytearray()
-        try:
-            while True:
-                chunk = self.port.read(1024)
-                if not chunk:
-                    break
-                flushed_data.extend(chunk)
-        finally:
-            # Restore original timeout if supported
-            if hasattr(self.port, 'set_read_timeout'):
-                self.port.set_read_timeout(old_timeout)
-
-        return flushed_data
-
-    def _read_frequencies(self) -> list[float]:
-        """Read frequency list using the frequencies command."""
-        self.port.write(b"frequencies\r\n")
-        response = self._read_until_prompt()
-        
-        frequencies = []
-        for line in response.strip().split('\n'):
-            line = line.strip()
-            if line and not line.startswith('frequencies') and not line.startswith('ch>'):
-                try:
-                    freq = float(line)
-                    frequencies.append(freq)
-                except ValueError:
-                    continue
-        
-        return frequencies
-
-    def _read_data_index(self, index: int = 0) -> VNAData:
-        """Read data using the data command with index."""
-        cmd = f"data {index}\r\n".encode()
+        """Run a one-shot sweep and return the text payload (mask 0x07)."""
+        config = self._require_config()
+        end = self._clock() + X_SCAN_BASE + X_SCAN_PER_POINT * config.points
+        self._flush_input()
+        cmd = (
+            f"scan {int(config.start)} {int(config.stop)} {config.points} {TEXT_SCAN_MASK:#04x}\r\n"
+        ).encode()
         self.port.write(cmd)
-        response = self._read_until_prompt()
-        
-        # Parse the data command response
-        data = VNAData(frequencies=[], s11=[], s21=[])
-        freq_list = self._read_frequencies()
-        
-        lines = response.strip().split('\n')
-        s11_data = []
-        
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith('data ') and not line.startswith('ch>'):
-                parts = line.split()
-                if len(parts) >= 2:  # real imag
-                    try:
-                        s11_real = float(parts[0])
-                        s11_imag = float(parts[1])
-                        s11_data.append(complex(s11_real, s11_imag))
-                    except ValueError:
-                        continue
-        
-        # For index 0 (S11) or 1 (S21), return the data
-        if index == 0:  # S11 data
-            # We need to get S21 separately, so return empty for now and get from scan
-            data.frequencies = freq_list[:len(s11_data)]
-            data.s11 = s11_data
-        elif index == 1:  # S21 data
-            # S11 would need to be separately retrieved
-            pass
-        
-        return data
+        raw = bytearray()
+        while True:
+            chunk = self._accumulate_until(lambda b: XDriver.PROMPT in b, end - self._clock())
+            if chunk is None:
+                raise ProtocolError(f"x: timed out reading scan data (received {len(raw)} bytes)")
+            raw.extend(chunk)
+            text = bytes(raw).replace(XDriver.PROMPT, b"\n").decode("utf-8", "replace")
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            data = self._parse_text_data(lines, config.points)
+            if data is not None:
+                return data
 
-    def _read_binary_data(self, expected_len: int) -> bytes:
-        """Read binary data from the device."""
-        data = bytearray()
-        while len(data) < expected_len:
-            remaining = expected_len - len(data)
-            chunk = self.port.read(remaining)
-            if not chunk:
-                raise RuntimeError(f"x: expected {expected_len} bytes, got {len(data)}")
-            data.extend(chunk)
-        return bytes(data)
+    def _read_until_prompt(self, deadline_seconds: float) -> str:
+        """Read until the shell prompt; return the payload before it."""
+        buf = self._accumulate_until(lambda b: XDriver.PROMPT in b, deadline_seconds)
+        if buf is None:
+            raise ProtocolError("x: timed out waiting for the shell prompt")
+        idx = buf.rfind(XDriver.PROMPT)
+        return buf[:idx].decode("utf-8", "replace")
 
-    def _read_scan_binary(self) -> VNAData:
-        """Perform a scan with binary output."""
-        if self.config.points <= 0:
-            raise RuntimeError("x: sweep not configured or zero points requested")
-        
-        # Request scan with binary mask (0x83 = freq + S11 + S21 + binary)
-        cmd = f"scan {int(self.config.start)} {int(self.config.stop)} {self.config.points} 0x83\r\n"
-        self.port.write(cmd.encode())
-        
-        # Read the binary header (mask + point count)
-        header = self._read_binary_data(4)
-        mask = struct.unpack('<H', header[:2])[0]  # Little-endian 16-bit
-        point_count = struct.unpack('<H', header[2:4])[0]  # Little-endian 16-bit
-        
-        # Calculate expected total bytes: point_count * (freq + s11 + s21)
-        # freq = 4 bytes (uint32), each complex sample = 8 bytes (2 floats * 4 bytes)
-        expected_bytes = point_count * (4 + 8 + 8)  # freq + s11_complex + s21_complex
-        
-        # Read the binary data
-        raw_data = self._read_binary_data(expected_bytes)
-        
-        # Parse the data
+    def _parse_text_data(self, lines: list[str], expected_points: int) -> VNAData | None:
+        """Parse scan text lines; None when a complete point set is absent."""
         data = VNAData(frequencies=[], s11=[], s21=[])
-        
-        step = (self.config.stop - self.config.start) / max(1, self.config.points - 1) if self.config.points > 1 else 0
-        
-        for i in range(point_count):
-            offset = i * 20  # 4 bytes for freq + 8 bytes for s11 + 8 bytes for s21
-            if offset + 20 > len(raw_data):
-                break
-                
-            # Frequency is 32-bit unsigned int
-            freq_raw = raw_data[offset:offset+4]
-            freq = struct.unpack('<I', freq_raw)[0]  # Little-endian unsigned int
-            
-            # S11 is two 32-bit floats
-            s11_real = struct.unpack('<f', raw_data[offset+4:offset+8])[0]
-            s11_imag = struct.unpack('<f', raw_data[offset+8:offset+12])[0]
-            
-            # S21 is two 32-bit floats
-            s21_real = struct.unpack('<f', raw_data[offset+12:offset+16])[0]
-            s21_imag = struct.unpack('<f', raw_data[offset+16:offset+20])[0]
-            
+        for line_no, line in enumerate(lines, start=1):
+            if line.startswith("scan ") or line.startswith("ch>"):
+                continue  # skip the command echo and stray prompt fragments
+            parts = line.split()
+            if len(parts) != 5:
+                raise ProtocolError(f"x: data line {line_no} has {len(parts)} values, expected 5")
+            try:
+                freq, s11_re, s11_im, s21_re, s21_im = (float(p) for p in parts)
+            except ValueError as exc:
+                raise ProtocolError(f"x: data line {line_no} is not numeric") from exc
             data.frequencies.append(freq)
-            data.s11.append(complex(s11_real, s11_imag))
-            data.s21.append(complex(s21_real, s21_imag))
-        
+            data.s11.append(complex(s11_re, s11_im))
+            data.s21.append(complex(s21_re, s21_im))
+        if len(data.frequencies) > expected_points:
+            raise ProtocolError(
+                f"x: device returned {len(data.frequencies)} points, expected {expected_points}"
+            )
+        if len(data.frequencies) < expected_points:
+            return None
         return data
 
 

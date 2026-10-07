@@ -1,19 +1,25 @@
 """Driver abstractions and VNA pooling logic."""
+
 from __future__ import annotations
 
+import logging
 from threading import RLock
-from typing import Dict, Protocol
+from typing import Protocol
 
-from .util.serial_port import SerialPortInterface, open_port
-from .models import SweepConfig, VNAData
-from .vna import VNA
 from .driver_v1 import V1Driver
 from .driver_v2 import V2Driver
 from .driver_x import XDriver
+from .models import SweepConfig, VNAData
+from .util.serial_port import SerialPortInterface, open_port
+from .vna import VNA
+
+logger = logging.getLogger(__name__)
 
 
 class Driver(Protocol):
-    """Interface that every hardware driver must implement."""
+    """Structural interface implemented by BaseDriver subclasses; also usable for test doubles."""
+
+    model: str | None
 
     def identify(self) -> str: ...
 
@@ -25,38 +31,31 @@ class Driver(Protocol):
 
 
 def driver_factory(port: SerialPortInterface) -> Driver:
-    """Try to detect the device and instantiate the right driver."""
+    """Probe the device with every known protocol and return a working driver.
 
-    # Try X driver first (NanoVNA-X with shell protocol)
-    x_driver = XDriver(port)
-    try:
-        x_driver.identify()
-        return x_driver
-    except Exception:
-        pass
-
-    # Try V1 protocol
-    v1_driver = V1Driver(port)
-    try:
-        v1_driver.identify()
-        return v1_driver
-    except Exception:
-        pass
-
-    # Try V2 protocol
-    v2_driver = V2Driver(port)
-    try:
-        v2_driver.identify()
-        return v2_driver
-    except Exception as exc:
-        raise RuntimeError("failed to identify VNA device") from exc
+    Probes are bounded in time, so the call always terminates. The returned
+    driver has `model` set to its identification string.
+    """
+    failures: list[str] = []
+    last_error: Exception | None = None
+    for driver_cls in (XDriver, V1Driver, V2Driver):
+        driver = driver_cls(port)
+        try:
+            driver.identify()
+            return driver
+        except Exception as exc:  # probe failure: record and try the next protocol
+            last_error = exc
+            logger.debug("%s probe failed: %s", driver_cls.__name__, exc)
+            failures.append(f"{driver_cls.__name__}: {exc}")
+    message = "unable to identify VNA device (" + "; ".join(failures) + ")"
+    raise RuntimeError(message) from last_error
 
 
 class VNAPool:
     """Manage a pool of open VNAs for concurrent access."""
 
     def __init__(self) -> None:
-        self._devices: Dict[str, VNA] = {}
+        self._devices: dict[str, VNA] = {}
         self._lock = RLock()
 
     def get(self, port_path: str) -> VNA:
@@ -64,11 +63,13 @@ class VNAPool:
             if port_path in self._devices:
                 return self._devices[port_path]
 
+            logger.debug("opening %s", port_path)
             port = open_port(port_path, baudrate=115200)
             try:
                 driver = driver_factory(port)
             except Exception:
                 port.close()
+                logger.debug("failed to identify device on %s", port_path)
                 raise
 
             vna = VNA(driver)

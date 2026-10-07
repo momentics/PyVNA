@@ -1,19 +1,21 @@
-"""High level VNA façade mirroring the Go implementation."""
+"""High level VNA façade over a concrete driver."""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from threading import Event, RLock
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from .calibration import (
     CalibrationErrorTerms,
+    CalibrationMeasurement,
+    CalibrationMethod,
     CalibrationPlan,
     CalibrationProfile,
     CalibrationPrompt,
-    CalibrationMeasurement,
-    CalibrationMethod,
     compute_error_terms,
 )
+from .errors import DeviceError
 from .models import SweepConfig, VNAData
 
 if TYPE_CHECKING:  # pragma: no cover - only used for type checking
@@ -23,15 +25,21 @@ if TYPE_CHECKING:  # pragma: no cover - only used for type checking
 class VNA:
     """Represents a single VNA device bound to a concrete driver."""
 
-    def __init__(self, driver: "Driver") -> None:
+    def __init__(self, driver: Driver) -> None:
         self._driver = driver
         self._lock = RLock()
-        self._calibration: Optional[CalibrationProfile] = None
+        self._calibration: CalibrationProfile | None = None
         self._closed = False
 
+    @property
+    def model(self) -> str:
+        """Identification string reported by the driver during probing."""
+        model = self._driver.model
+        if model is None:
+            raise DeviceError("the driver has not been identified")
+        return model
+
     def set_sweep(self, config: SweepConfig) -> None:
-        if config.start >= config.stop or config.points <= 0:
-            raise ValueError("invalid sweep parameters")
         with self._lock:
             self._driver.set_sweep(config)
 
@@ -39,6 +47,7 @@ class VNA:
         with self._lock:
             data = self._driver.scan()
             calibration = self._calibration
+        data.validate()
         if calibration is None:
             return data
         return calibration.apply(data)
@@ -71,20 +80,18 @@ class VNA:
     def acquire_calibration(
         self,
         plan: CalibrationPlan,
-        prompt: Optional[CalibrationPrompt] = None,
-        cancel_event: Optional[Event] = None,
+        prompt: CalibrationPrompt | None = None,
+        cancel_event: Event | None = None,
     ) -> CalibrationProfile:
         if not plan.steps:
             raise ValueError("calibration plan does not contain steps")
-        if plan.sweep.points <= 0 or plan.sweep.start >= plan.sweep.stop:
-            raise ValueError("invalid sweep parameters in calibration plan")
 
         self.set_sweep(plan.sweep)
 
         profile = CalibrationProfile(
             name=plan.name,
             method=CalibrationMethod.SOL,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
             sweep=plan.sweep,
             frequencies=[],
             standards={},

@@ -5,22 +5,54 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pyvna"
 version = "0.2.0"
-description = "Python reimplementation of GoVNA for low-cost vector network analyzers"
+description = "Python driver library for low-cost vector network analyzers (NanoVNA family)"
 readme = "README.md"
-authors = [{name = "GoVNA Contributors"}]
+authors = [{name = "momentics"}]
 requires-python = ">=3.12"
+license = {text = "MIT"}
+urls.homepage = "https://github.com/momentics/PyVNA"
+urls.issues = "https://github.com/momentics/PyVNA/issues"
 dependencies = [
     "pyserial>=3.5",
-    "prometheus-client>=0.17",
-    "fastapi>=0.104",
-    "uvicorn>=0.23"
 ]
-
-[tool.setuptools]
-packages = ["pyvna", "pyvna.util", "pyvna.server"]
 
 [project.optional-dependencies]
+server = [
+    "fastapi>=0.104",
+    "uvicorn>=0.23",
+    "prometheus-client>=0.17",
+]
 test = [
     "pytest>=7.4",
-    "pytest-mock>=3.11"
+    "pytest-mock>=3.11",
+    "pytest-timeout>=2.1",
+    "httpx>=0.25",
 ]
+dev = [
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "pytest>=7.4",
+    "pytest-mock>=3.11",
+    "pytest-timeout>=2.1",
+    "httpx>=0.25",
+]
+
+[tool.setuptools.packages.find]
+include = ["pyvna*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 60
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["pyvna"]
+warn_unused_ignores = true
+no_implicit_optional = true
